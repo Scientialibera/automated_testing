@@ -1,0 +1,2 @@
+query,title,content
+what is the debt recovery loan code?,Debt_Lending, The Debt Lending recovery loan code is 20.
