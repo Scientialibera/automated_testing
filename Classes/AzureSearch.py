@@ -1,120 +1,125 @@
+"""Azure AI Search helper retained for the evaluation notebooks.
+
+The public ``Config`` / ``AzureSearch`` names and ``vector_search`` signature are
+kept compatible with the historical notebooks while the implementation uses
+current Azure Search and Azure OpenAI SDK APIs.
+"""
+
+from __future__ import annotations
+
 import os
-import openai
-import time
+
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from azure.search.documents import SearchClient
-from azure.search.documents.models import Vector, QueryType
-from azure.identity import DefaultAzureCredential
+from azure.search.documents.models import QueryType, VectorizedQuery
 from dotenv import load_dotenv
+from openai import AzureOpenAI
 
-# Class to handle Azure Search operations
+
 class Config:
-    def __init__(self, path='./environment.env'):
-        # Load environment variables from specified file path
-        load_dotenv(dotenv_path=path)
+    def __init__(self, path: str = ".env") -> None:
+        load_dotenv(dotenv_path=path, override=False)
+        self.endpoint = os.getenv("AZURE_SEARCH_ENDPOINT") or os.getenv("COG_ENDPOINT")
+        self.vector_field = os.getenv("AZURE_SEARCH_VECTOR_FIELD") or os.getenv("VECTOR_FIELD_NAME")
+        self.index_name = os.getenv("AZURE_SEARCH_INDEX") or os.getenv("INDEX_NAME")
+        self.top_k = int(os.getenv("AZURE_SEARCH_TOP_K") or os.getenv("TOP_K") or "3")
+        self.open_ai_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv("OPENAI_ENDPOINT") or os.getenv("OPENAI_API_BASE")
+        self.engine = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT") or os.getenv("EMBEDDING")
+        self.gpt = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT") or os.getenv("GPT")
+        self.openai_api_version = os.getenv("AZURE_OPENAI_API_VERSION") or os.getenv("OPENAI_API_VERSION") or "2024-10-21"
 
-        # Azure Search Service configurations
-        self.endpoint = os.getenv("COG_ENDPOINT")
-        self.vector_config_name = os.getenv("VECTOR_CONFIG_NAME")
-        self.vector_field = os.getenv("VECTOR_FIELD_NAME")
-        self.index_name = os.getenv("INDEX_NAME")
-        self.top_k = os.getenv("TOP_K")
+        required = {
+            "AZURE_SEARCH_ENDPOINT": self.endpoint,
+            "AZURE_SEARCH_VECTOR_FIELD": self.vector_field,
+            "AZURE_SEARCH_INDEX": self.index_name,
+            "AZURE_OPENAI_ENDPOINT": self.open_ai_endpoint,
+            "AZURE_OPENAI_EMBEDDING_DEPLOYMENT": self.engine,
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            raise ValueError(f"Missing required configuration: {', '.join(missing)}")
 
-        # OpenAI API configurations
-        self.open_ai_endpoint = os.getenv("OPENAI_ENDPOINT")
-        self.engine = os.getenv("EMBEDDING")
-        self.gpt = os.getenv("GPT")
-
-        # Additional OpenAI configurations
-        self.openai_api_base = os.getenv("OPENAI_API_BASE")
-        self.openai_api_version = os.getenv("OPENAI_API_VERSION")
 
 class AzureSearch:
-    def __init__(self, config, index_name):
-        # Initialize with configurations
+    def __init__(self, config: Config, index_name: str | None = None) -> None:
         self.endpoint = config.endpoint
-        self.open_ai_endpoint = config.open_ai_endpoint
         self.engine = config.engine
-        self.index_name = index_name
+        self.index_name = index_name or config.index_name
         self.vector_field = config.vector_field
+        self._credential = DefaultAzureCredential()
+        self.search_client = SearchClient(
+            endpoint=self.endpoint,
+            index_name=self.index_name,
+            credential=self._credential,
+        )
+        token_provider = get_bearer_token_provider(
+            self._credential,
+            "https://cognitiveservices.azure.com/.default",
+        )
+        self.openai_client = AzureOpenAI(
+            azure_endpoint=config.open_ai_endpoint,
+            api_version=config.openai_api_version,
+            azure_ad_token_provider=token_provider,
+        )
 
-        # Use Azure Default Credential for Azure Search Client
-        azure_cred = DefaultAzureCredential()
-        self.search_client = SearchClient(endpoint=self.endpoint, index_name=self.index_name, credential=azure_cred)
+    def generate_embeddings(self, text: str) -> list[float]:
+        if not text or not text.strip():
+            raise ValueError("text must not be empty")
+        response = self.openai_client.embeddings.create(
+            model=self.engine,
+            input=text.strip(),
+        )
+        return list(response.data[0].embedding)
 
-        # Use Azure Default Credential for OpenAI
-        token_credential = azure_cred.get_token("https://cognitiveservices.azure.com/.default")
-        openai.api_key = token_credential.token
-        openai.api_version = config.openai_api_version
-        openai.api_type = "azure_ad"
-        openai.api_base = config.openai_api_base
-    
-    # Method to generate embeddings for a given text using OpenAI
-    def generate_embeddings(self, text):
-    
-        # Trim the text if it exceeds the token limit
-        words = text.split()
-        if len(words) > 6000:
-            words = words[:6000]
-            trimmed_text = ' '.join(words)
-        else:
-            trimmed_text = text
+    def vector_search(
+        self,
+        query: str,
+        filter: str | None,
+        k: int = 5,
+        select_fields=None,
+        vector_search: bool = True,
+        semantic_search: bool = False,
+    ):
+        if not query or not query.strip():
+            raise ValueError("query must not be empty")
+        if k < 1:
+            raise ValueError("k must be >= 1")
 
-        retries = 0
-        wait_time = 30  # Starting wait time in seconds
-        max_retries = 5
+        selected = None
+        if isinstance(select_fields, str) and select_fields != "*":
+            selected = [field.strip() for field in select_fields.split(",") if field.strip()]
+        elif select_fields not in (None, "*"):
+            selected = list(select_fields)
 
-        while retries < max_retries:
-            try:
-                response = openai.Embedding.create(
-                    input=trimmed_text,
-                    engine=self.engine
-                )
-                return response['data'][0]['embedding']
-            except Exception as e:  # Catch the specific exception for rate limits if possible
-                retries += 1
-                if retries < max_retries:
-                    print(f"Rate limit exceeded, waiting for {wait_time} seconds before retrying...")
-                    time.sleep(wait_time)
-                    # Optionally increase wait_time if needed, or keep it constant
-                else:
-                    print("Maximum retries reached. Returning error.")
-                    return {'error': str(e)}
-    
-    # Method to perform a vector search on the Azure Cognitive Search index
-    def vector_search(self, query, filter, k=5, select_fields=None, vector_search=True, semantic_search=False):
-        # Initialize parameters
-        vectors_param = None
-        order_by_param = "search.score() desc"
-
-        # Check if vector search is enabled
+        vector_queries = None
         if vector_search:
-            vector = Vector(value=self.generate_embeddings(query), k=k, fields=self.vector_field)
-            vectors_param = [vector]
-            order_by_param = None  # Removing the order_by clause if vector_search is true
+            vector_queries = [
+                VectorizedQuery(
+                    vector=self.generate_embeddings(query),
+                    k_nearest_neighbors=k,
+                    fields=self.vector_field,
+                    kind="vector",
+                )
+            ]
 
-        # Set default fields if none are provided
-        if select_fields is None:
-            select_fields = "*"
-
-        # Perform semantic search if enabled
+        kwargs = {
+            "search_text": query,
+            "filter": filter or None,
+            "top": k,
+            "select": selected,
+            "vector_queries": vector_queries,
+        }
         if semantic_search:
-            return self.search_client.search(
-                query,
-                filter=filter,
-                query_type=QueryType.SEMANTIC,
-                semantic_configuration_name="default",
-                top=k,
-                vector_queries=vectors_param if vectors_param else None,
-                select=select_fields,
-                order_by=order_by_param,
+            kwargs.update(
+                {
+                    "query_type": QueryType.SEMANTIC,
+                    "semantic_configuration_name": "default",
+                    "semantic_query": query,
+                }
             )
-        else:
-            # Perform traditional or vector search
-            return self.search_client.search(
-                search_text=query,
-                top=k,
-                vectors=vectors_param,
-                select=select_fields,
-                order_by=order_by_param,
-                filter=filter if filter else None
-            )
+        return self.search_client.search(**kwargs)
+
+    def close(self) -> None:
+        self.search_client.close()
+        self.openai_client.close()
+        self._credential.close()
